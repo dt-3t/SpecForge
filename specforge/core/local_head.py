@@ -43,8 +43,6 @@ class OnlineLocalHeadModel(nn.Module):
         low_rank_dim: int = 256,
         block_size: int = 16,
         num_anchors: int = 512,
-        pure_draft_prefix_len: int = 1,
-        shift_label: bool = False,
         loss_decay_gamma: Optional[float] = None,
         lm_head_mode: str = "low_rank",
         lm_head_init: str = "random",
@@ -57,15 +55,8 @@ class OnlineLocalHeadModel(nn.Module):
             raise ValueError(
                 f"lm_head_mode={lm_head_mode!r}; must be one of {_VALID_LM_HEAD_MODES}"
             )
-        if pure_draft_prefix_len < 0:
-            raise ValueError("pure_draft_prefix_len must be non-negative")
-        max_supervised_start = block_size if shift_label else block_size - 1
-        if pure_draft_prefix_len >= max_supervised_start:
-            raise ValueError(
-                "pure_draft_prefix_len leaves no supervised local-head targets: "
-                f"got pure_draft_prefix_len={pure_draft_prefix_len}, "
-                f"block_size={block_size}, shift_label={shift_label}"
-            )
+        if block_size < 2:
+            raise ValueError("block_size must be at least 2")
         if low_rank_dim <= 0:
             raise ValueError("low_rank_dim must be positive")
         if rank_activation not in _VALID_RANK_ACTIVATIONS:
@@ -84,8 +75,6 @@ class OnlineLocalHeadModel(nn.Module):
         self.low_rank_dim = low_rank_dim
         self.block_size = block_size
         self.num_anchors = num_anchors
-        self.pure_draft_prefix_len = pure_draft_prefix_len
-        self.shift_label = shift_label
         self.loss_decay_gamma = loss_decay_gamma
         self.lm_head_mode = lm_head_mode
         self.rank_activation = rank_activation
@@ -174,14 +163,8 @@ class OnlineLocalHeadModel(nn.Module):
         device = input_ids.device
         bs = self.block_size
 
-        if self.shift_label:
-            prev_offsets = torch.arange(0, bs, device=device).view(1, 1, -1)
-            target_offsets = torch.arange(1, bs + 1, device=device).view(1, 1, -1)
-            supervised_start = self.pure_draft_prefix_len
-        else:
-            prev_offsets = torch.arange(0, bs - 1, device=device).view(1, 1, -1)
-            target_offsets = torch.arange(1, bs, device=device).view(1, 1, -1)
-            supervised_start = self.pure_draft_prefix_len
+        prev_offsets = torch.arange(0, bs - 1, device=device).view(1, 1, -1)
+        target_offsets = torch.arange(1, bs, device=device).view(1, 1, -1)
 
         prev_ids, _, _ = self._gather_block_ids(
             input_ids, anchor_positions, prev_offsets
@@ -192,9 +175,9 @@ class OnlineLocalHeadModel(nn.Module):
 
         return (
             prev_ids,
-            target_ids[:, :, supervised_start:],
-            safe_target_indices[:, :, supervised_start:],
-            valid_label_mask[:, :, supervised_start:],
+            target_ids,
+            safe_target_indices,
+            valid_label_mask,
         )
 
     def _compute_logits(self, prev_ids: torch.Tensor) -> torch.Tensor:
@@ -205,7 +188,6 @@ class OnlineLocalHeadModel(nn.Module):
         rank_states = self.rank_proj(gru_out).reshape(bsz, n, t, -1)
         if self.rank_activation == "silu":
             rank_states = F.silu(rank_states)
-        rank_states = rank_states[:, :, self.pure_draft_prefix_len :, :]
 
         if self.lm_head_mode == "low_rank":
             return self.low_rank_lm_head(rank_states)

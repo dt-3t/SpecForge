@@ -81,26 +81,6 @@ def parse_args():
         help="Number of anchor positions per sequence",
     )
     model_group.add_argument(
-        "--pure-draft-prefix-len",
-        type=int,
-        default=1,
-        help=(
-            "Number of next-token targets to leave unsupervised before training "
-            "the local head. The first supervised target is "
-            "anchor + pure_draft_prefix_len + 1."
-        ),
-    )
-    model_group.add_argument(
-        "--shift-label",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help=(
-            "If true, block position 0 predicts anchor+1; otherwise position 1 "
-            "predicts anchor+1. Must be explicitly set with --shift-label or "
-            "--no-shift-label."
-        ),
-    )
-    model_group.add_argument(
         "--local-gru-hidden-dim",
         type=int,
         default=1024,
@@ -374,8 +354,6 @@ def _local_head_config(args, model) -> dict:
         "low_rank_dim": model.low_rank_dim,
         "block_size": model.block_size,
         "num_anchors": model.num_anchors,
-        "pure_draft_prefix_len": model.pure_draft_prefix_len,
-        "shift_label": model.shift_label,
         "loss_decay_gamma": model.loss_decay_gamma,
         "lm_head_mode": model.lm_head_mode,
         "rank_activation": model.rank_activation,
@@ -741,8 +719,6 @@ def build_local_head_model(args, target_components, tokenizer, device):
         low_rank_dim=args.local_rank,
         block_size=args.block_size,
         num_anchors=args.num_anchors,
-        pure_draft_prefix_len=args.pure_draft_prefix_len,
-        shift_label=args.shift_label,
         loss_decay_gamma=args.loss_decay_gamma,
         lm_head_mode=args.local_lm_head_mode,
         lm_head_init=args.local_lm_head_init,
@@ -768,16 +744,6 @@ def main():
     set_seed(args.seed)
 
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
-    if args.local_head_type == "rnn" and args.shift_label is None:
-        raise ValueError(
-            "Training an RNN/GRU local head requires explicitly setting "
-            "--shift-label or --no-shift-label."
-        )
-    if args.local_head_type == "rnn" and int(args.pure_draft_prefix_len) != 1:
-        print_on_rank0(
-            "!!! WARNING: pure_draft_prefix_len is set to "
-            f"{args.pure_draft_prefix_len}, not the default/recommended value 1. !!!"
-        )
     if args.local_head_type == "rnn":
         args.loss_decay_gamma = resolve_loss_decay_gamma(
             args.loss_decay_gamma, args.block_size
@@ -831,8 +797,7 @@ def main():
     else:
         print_on_rank0(
             "RNN local head config: "
-            f"block_size={args.block_size}, shift_label={args.shift_label}, "
-            f"pure_prefix={args.pure_draft_prefix_len}, "
+            f"block_size={args.block_size}, "
             f"gru_hidden_dim={args.local_gru_hidden_dim}, rank={args.local_rank}, "
             f"lm_head_mode={args.local_lm_head_mode}, "
             f"rank_activation={args.local_rank_activation}"

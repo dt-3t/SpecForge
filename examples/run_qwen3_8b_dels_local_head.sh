@@ -32,8 +32,6 @@ torchrun \
     --chat-template qwen \
     --block-size 16 \
     --num-anchors 512 \
-    --pure-draft-prefix-len 0 \
-    --shift-label \
     --local-lm-head-mode target_lm_head \
     --local-up-proj-init zero \
     --local-rank-activation silu \
