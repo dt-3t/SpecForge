@@ -9,6 +9,7 @@ import torch.nn.functional as F
 
 
 _VALID_LM_HEAD_MODES = {"low_rank", "target_lm_head"}
+_VALID_RNN_PARAMETERIZATIONS = {"target_factorized", "direct_vocab"}
 _VALID_INIT_MODES = {"random", "zero"}
 _VALID_RANK_ACTIVATIONS = {"identity", "silu"}
 
@@ -36,51 +37,91 @@ class OnlineLocalHeadModel(nn.Module):
 
     def __init__(
         self,
-        target_embed_tokens: nn.Module,
+        target_embed_tokens: Optional[nn.Module],
         vocab_size: int,
         embed_dim: int,
         gru_hidden_dim: int = 1024,
         low_rank_dim: int = 256,
+        input_rank_dim: Optional[int] = None,
         block_size: int = 16,
         num_anchors: int = 512,
         loss_decay_gamma: Optional[float] = None,
-        lm_head_mode: str = "low_rank",
+        lm_head_mode: str = "target_lm_head",
         lm_head_init: str = "random",
+        rnn_parameterization: str = "target_factorized",
         rank_activation: str = "identity",
         target_lm_head: Optional[nn.Module] = None,
         up_proj_init: str = "random",
     ):
         super().__init__()
+        if rnn_parameterization not in _VALID_RNN_PARAMETERIZATIONS:
+            raise ValueError(
+                f"rnn_parameterization={rnn_parameterization!r}; must be one of "
+                f"{_VALID_RNN_PARAMETERIZATIONS}"
+            )
         if lm_head_mode not in _VALID_LM_HEAD_MODES:
             raise ValueError(
                 f"lm_head_mode={lm_head_mode!r}; must be one of {_VALID_LM_HEAD_MODES}"
+            )
+        if rnn_parameterization == "direct_vocab" and lm_head_mode != "low_rank":
+            raise ValueError(
+                "direct_vocab RNN local heads require lm_head_mode='low_rank'"
+            )
+        if (
+            rnn_parameterization == "target_factorized"
+            and lm_head_mode != "target_lm_head"
+        ):
+            raise ValueError(
+                "target_factorized RNN local heads require "
+                "lm_head_mode='target_lm_head'"
             )
         if block_size < 2:
             raise ValueError("block_size must be at least 2")
         if low_rank_dim <= 0:
             raise ValueError("low_rank_dim must be positive")
+        if input_rank_dim is None:
+            input_rank_dim = low_rank_dim
+        if input_rank_dim <= 0:
+            raise ValueError("input_rank_dim must be positive")
         if rank_activation not in _VALID_RANK_ACTIVATIONS:
             raise ValueError(
                 f"rank_activation={rank_activation!r}; must be one of "
                 f"{_VALID_RANK_ACTIVATIONS}"
             )
 
-        self.embed_tokens = target_embed_tokens
-        self.embed_tokens.requires_grad_(False)
-        self.embed_tokens.eval()
-
-        self.vocab_size = vocab_size
-        self.embed_dim = embed_dim
-        self.gru_hidden_dim = gru_hidden_dim
-        self.low_rank_dim = low_rank_dim
+        self.vocab_size = int(vocab_size)
+        self.embed_dim = int(embed_dim)
+        self.input_rank_dim = int(input_rank_dim)
+        self.gru_input_dim = int(input_rank_dim)
+        self.gru_hidden_dim = int(gru_hidden_dim)
+        self.low_rank_dim = int(low_rank_dim)
         self.block_size = block_size
         self.num_anchors = num_anchors
         self.loss_decay_gamma = loss_decay_gamma
         self.lm_head_mode = lm_head_mode
+        self.rnn_parameterization = rnn_parameterization
         self.rank_activation = rank_activation
+        self.target_hidden_size = None
+
+        self.embed_down_proj = None
+        if rnn_parameterization == "direct_vocab":
+            self.embed_tokens = nn.Embedding(self.vocab_size, self.input_rank_dim)
+            self.embed_dim = self.input_rank_dim
+        else:
+            if target_embed_tokens is None:
+                raise ValueError(
+                    "target_embed_tokens is required for target_factorized RNN "
+                    "local heads"
+                )
+            self.embed_tokens = target_embed_tokens
+            self.embed_tokens.requires_grad_(False)
+            self.embed_tokens.eval()
+            self.embed_down_proj = nn.Linear(
+                self.embed_dim, self.input_rank_dim, bias=False
+            )
 
         self.prefix_gru = nn.GRU(
-            input_size=embed_dim,
+            input_size=self.gru_input_dim,
             hidden_size=gru_hidden_dim,
             num_layers=1,
             batch_first=True,
@@ -98,6 +139,7 @@ class OnlineLocalHeadModel(nn.Module):
             if target_lm_head is None:
                 raise ValueError("target_lm_head is required for target_lm_head mode")
             target_hidden_size = target_lm_head.weight.shape[1]
+            self.target_hidden_size = int(target_hidden_size)
             self.rank_to_hidden = nn.Linear(
                 low_rank_dim, target_hidden_size, bias=False
             )
@@ -183,6 +225,8 @@ class OnlineLocalHeadModel(nn.Module):
     def _compute_logits(self, prev_ids: torch.Tensor) -> torch.Tensor:
         bsz, n, t = prev_ids.shape
         block_emb = self.embed_tokens(prev_ids)
+        if self.embed_down_proj is not None:
+            block_emb = self.embed_down_proj(block_emb)
         gru_inputs = block_emb.reshape(bsz * n, t, -1)
         gru_out = self.prefix_gru(gru_inputs)[0]
         rank_states = self.rank_proj(gru_out).reshape(bsz, n, t, -1)
@@ -298,7 +342,7 @@ class OnlineLocalHeadModel(nn.Module):
 
         return loss, accuracy, metrics
 
-    def merged_lm_head_weight(self) -> torch.Tensor:
+    def fused_lm_head_weight(self) -> torch.Tensor:
         """Return a vocab x rank low-rank head usable after training."""
         if self.lm_head_mode == "low_rank":
             return self.low_rank_lm_head.weight.detach()
@@ -306,6 +350,15 @@ class OnlineLocalHeadModel(nn.Module):
         target_weight = self.target_lm_head.weight.detach().to(torch.float32)
         up_weight = self.rank_to_hidden.weight.detach().to(torch.float32)
         return target_weight.matmul(up_weight).to(self.rank_to_hidden.weight.dtype)
+
+    def merged_embedding_weight(self) -> torch.Tensor:
+        """Return a vocab x input-rank embedding usable after training."""
+        if self.rnn_parameterization == "direct_vocab":
+            return self.embed_tokens.weight.detach()
+
+        embed_weight = self.embed_tokens.weight.detach().to(torch.float32)
+        down_weight = self.embed_down_proj.weight.detach().to(torch.float32)
+        return embed_weight.matmul(down_weight.t()).to(self.embed_down_proj.weight.dtype)
 
 
 class OnlineMarkovLocalHeadModel(nn.Module):
@@ -426,7 +479,7 @@ class OnlineMarkovLocalHeadModel(nn.Module):
         down_weight = self.down_proj.detach().to(torch.float32)
         return embed_weight.matmul(down_weight).to(self.down_proj.dtype)
 
-    def merged_lm_head_weight(self) -> torch.Tensor:
+    def fused_lm_head_weight(self) -> torch.Tensor:
         """Return vocab x rank lm_head after folding up_proj into target lm_head."""
         target_weight = self.target_lm_head.weight.detach().to(torch.float32)
         up_weight = self.up_proj.detach().to(torch.float32)
@@ -532,6 +585,6 @@ class OnlineDirectVocabMarkovLocalHeadModel(nn.Module):
         """Return the trainable vocab x rank embedding factor."""
         return self.embedding_weight.detach()
 
-    def merged_lm_head_weight(self) -> torch.Tensor:
+    def fused_lm_head_weight(self) -> torch.Tensor:
         """Return the trainable vocab x rank output factor."""
         return self.lm_head_weight.detach()

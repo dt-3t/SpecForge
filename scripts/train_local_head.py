@@ -93,13 +93,43 @@ def parse_args():
         help="Low-rank dimension r after GRU hidden-state projection.",
     )
     model_group.add_argument(
+        "--local-input-rank",
+        type=int,
+        default=None,
+        help=(
+            "Input rank for RNN local-head token embeddings. Defaults to "
+            "--local-rank."
+        ),
+    )
+    model_group.add_argument(
+        "--local-head-parameterization",
+        type=str,
+        default="target_factorized",
+        choices=["target_factorized", "direct_vocab"],
+        help=(
+            "Parameterization for the selected local head. target_factorized "
+            "freezes target embedding/lm_head and trains low-rank adapters; "
+            "direct_vocab trains vocab-space factors directly."
+        ),
+    )
+    model_group.add_argument(
+        "--rnn-parameterization",
+        type=str,
+        default=None,
+        choices=["target_factorized", "direct_vocab"],
+        help=(
+            "Deprecated alias for --local-head-parameterization when "
+            "--local-head-type rnn."
+        ),
+    )
+    model_group.add_argument(
         "--local-lm-head-mode",
         type=str,
-        default="low_rank",
-        choices=["low_rank", "target_lm_head"],
+        default="auto",
+        choices=["auto", "low_rank", "target_lm_head"],
         help=(
-            "Use a trainable low-rank vocab head, or use a frozen target lm_head "
-            "after a trainable r->target-hidden projection."
+            "Legacy output-head override. auto selects target_lm_head for "
+            "target_factorized RNN and low_rank for direct_vocab RNN."
         ),
     )
     model_group.add_argument(
@@ -138,12 +168,11 @@ def parse_args():
     model_group.add_argument(
         "--markov-parameterization",
         type=str,
-        default="target_factorized",
+        default=None,
         choices=["target_factorized", "direct_vocab"],
         help=(
-            "target_factorized freezes target embedding/lm_head and trains "
-            "hidden-size down/up projections. direct_vocab trains two vocab x rank "
-            "matrices directly and does not load target embedding/lm_head."
+            "Deprecated alias for --local-head-parameterization when "
+            "--local-head-type markov."
         ),
     )
     model_group.add_argument(
@@ -199,11 +228,12 @@ def parse_args():
     output_group.add_argument("--eval-interval", type=int, default=1000)
     output_group.add_argument("--save-interval", type=int, default=10000)
     output_group.add_argument(
-        "--save-merged-lm-head",
-        action="store_true",
+        "--save-merged-rnn-weights",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help=(
-            "Also save merged_lm_head.pt as vocab x r weights. In "
-            "target_lm_head mode this is target_lm_head.weight @ up_proj.weight."
+            "For RNN local heads, save merged_rnn_local_head.pt with fused "
+            "vocab-space embedding/head weights. Enabled by default."
         ),
     )
     output_group.add_argument(
@@ -254,7 +284,30 @@ def parse_args():
     dist_group = parser.add_argument_group("distributed")
     dist_group.add_argument("--dist-timeout", type=int, default=30)
 
-    return parser.parse_args()
+    args = parser.parse_args()
+    return _resolve_local_head_parameterization(parser, args)
+
+
+def _resolve_local_head_parameterization(parser, args):
+    active_alias = (
+        args.rnn_parameterization
+        if args.local_head_type == "rnn"
+        else args.markov_parameterization
+    )
+    if active_alias is not None:
+        if (
+            args.local_head_parameterization != "target_factorized"
+            and args.local_head_parameterization != active_alias
+        ):
+            parser.error(
+                "--local-head-parameterization conflicts with the deprecated "
+                f"--{args.local_head_type}-parameterization alias."
+            )
+        args.local_head_parameterization = active_alias
+
+    args.rnn_parameterization = args.local_head_parameterization
+    args.markov_parameterization = args.local_head_parameterization
+    return args
 
 
 def build_dataloader(
@@ -326,8 +379,15 @@ def build_dataloader(
     return train_dataloader, eval_dataloader, unigram_dataset
 
 
-def _is_frozen_target_key(name: str) -> bool:
-    return name.startswith("embed_tokens.") or name.startswith("target_lm_head.")
+def _is_frozen_target_key(name: str, model=None) -> bool:
+    if name.startswith("target_lm_head."):
+        return True
+    if not name.startswith("embed_tokens."):
+        return False
+
+    if getattr(model, "rnn_parameterization", None) == "direct_vocab":
+        return False
+    return True
 
 
 def _local_head_config(args, model) -> dict:
@@ -337,6 +397,7 @@ def _local_head_config(args, model) -> dict:
         "target_model_path": args.target_model_path,
         "embedding_key": args.embedding_key,
         "lm_head_key": args.lm_head_key,
+        "local_head_parameterization": args.local_head_parameterization,
     }
     if args.local_head_type == "markov":
         return {
@@ -350,23 +411,67 @@ def _local_head_config(args, model) -> dict:
     return {
         **common,
         "embed_dim": model.embed_dim,
+        "input_rank_dim": model.input_rank_dim,
+        "gru_input_dim": model.gru_input_dim,
         "gru_hidden_dim": model.gru_hidden_dim,
         "low_rank_dim": model.low_rank_dim,
         "block_size": model.block_size,
         "num_anchors": model.num_anchors,
         "loss_decay_gamma": model.loss_decay_gamma,
         "lm_head_mode": model.lm_head_mode,
+        "rnn_parameterization": model.rnn_parameterization,
+        "target_hidden_size": model.target_hidden_size,
         "rank_activation": model.rank_activation,
     }
 
 
-def _merged_lm_head_from_state(model: OnlineLocalHeadModel, state_dict: dict):
+def _rnn_lm_head_weight_from_state(model: OnlineLocalHeadModel, state_dict: dict):
     if model.lm_head_mode == "low_rank":
         return state_dict["low_rank_lm_head.weight"]
 
     target_weight = state_dict["target_lm_head.weight"].to(torch.float32)
     up_weight = state_dict["rank_to_hidden.weight"].to(torch.float32)
     return target_weight.matmul(up_weight).to(up_weight.dtype)
+
+
+def _merged_rnn_state(args, model: OnlineLocalHeadModel, state_dict: dict) -> dict:
+    if model.rnn_parameterization == "direct_vocab":
+        embedding_weight = state_dict["embed_tokens.weight"]
+        lm_head_weight = state_dict["low_rank_lm_head.weight"]
+    else:
+        embed_weight = state_dict["embed_tokens.weight"].to(torch.float32)
+        down_weight = state_dict["embed_down_proj.weight"].to(torch.float32)
+        embedding_weight = embed_weight.matmul(down_weight.t()).to(down_weight.dtype)
+        lm_head_weight = _rnn_lm_head_weight_from_state(model, state_dict)
+
+    model_state_dict = {
+        k: v
+        for k, v in state_dict.items()
+        if k.startswith("prefix_gru.") or k.startswith("rank_proj.")
+    }
+    model_state_dict["low_rank_lm_head.weight"] = lm_head_weight
+    model_state_dict["embed_tokens.weight"] = embedding_weight
+
+    model_config = {
+        **_local_head_config(args, model),
+        "source_rnn_parameterization": model.rnn_parameterization,
+        "source_lm_head_mode": model.lm_head_mode,
+        "rnn_parameterization": "direct_vocab",
+        "lm_head_mode": "low_rank",
+        "architecture": "direct_vocab_rnn",
+        "embed_dim": model.gru_input_dim,
+        "target_hidden_size": None,
+    }
+
+    return {
+        "embedding_weight": embedding_weight,
+        "lm_head_weight": lm_head_weight,
+        "vocab_size": model.vocab_size,
+        "input_rank_dim": model.input_rank_dim,
+        "low_rank_dim": model.low_rank_dim,
+        "model_config": model_config,
+        "model_state_dict": model_state_dict,
+    }
 
 
 def _merged_markov_state(args, model, state_dict: dict) -> dict:
@@ -399,7 +504,9 @@ def save_checkpoint(args, epoch, step, fsdp_model, local_head_model, optimizer):
     with FSDP.state_dict_type(fsdp_model, StateDictType.FULL_STATE_DICT):
         state_dict = fsdp_model.state_dict()
         local_state_dict = {
-            k: v for k, v in state_dict.items() if not _is_frozen_target_key(k)
+            k: v
+            for k, v in state_dict.items()
+            if not _is_frozen_target_key(k, local_head_model)
         }
 
         if dist.get_rank() == 0:
@@ -415,14 +522,10 @@ def save_checkpoint(args, epoch, step, fsdp_model, local_head_model, optimizer):
                 checkpoint_payload,
                 os.path.join(save_dir, "local_head.pt"),
             )
-            if args.local_head_type == "rnn" and args.save_merged_lm_head:
+            if args.local_head_type == "rnn" and args.save_merged_rnn_weights:
                 torch.save(
-                    {
-                        "weight": _merged_lm_head_from_state(
-                            local_head_model, state_dict
-                        )
-                    },
-                    os.path.join(save_dir, "merged_lm_head.pt"),
+                    _merged_rnn_state(args, local_head_model, state_dict),
+                    os.path.join(save_dir, "merged_rnn_local_head.pt"),
                 )
             if (
                 args.local_head_type == "markov"
@@ -691,6 +794,55 @@ def build_local_head_model(args, target_components, tokenizer, device):
             rank=args.markov_rank,
         ).to(device=device, dtype=torch.bfloat16)
 
+    if args.local_head_type == "rnn":
+        if args.local_lm_head_mode == "auto":
+            local_lm_head_mode = (
+                "target_lm_head"
+                if args.rnn_parameterization == "target_factorized"
+                else "low_rank"
+            )
+        else:
+            local_lm_head_mode = args.local_lm_head_mode
+        if (
+            args.rnn_parameterization == "target_factorized"
+            and local_lm_head_mode != "target_lm_head"
+        ):
+            raise ValueError(
+                "RNN target_factorized parameterization requires "
+                "--local-lm-head-mode target_lm_head or auto."
+            )
+        if (
+            args.rnn_parameterization == "direct_vocab"
+            and local_lm_head_mode != "low_rank"
+        ):
+            raise ValueError(
+                "RNN direct_vocab parameterization requires "
+                "--local-lm-head-mode low_rank or auto."
+            )
+        input_rank_dim = (
+            args.local_input_rank
+            if args.local_input_rank is not None
+            else args.local_rank
+        )
+        if args.rnn_parameterization == "direct_vocab":
+            return OnlineLocalHeadModel(
+                target_embed_tokens=None,
+                target_lm_head=None,
+                vocab_size=len(tokenizer),
+                embed_dim=input_rank_dim,
+                input_rank_dim=input_rank_dim,
+                gru_hidden_dim=args.local_gru_hidden_dim,
+                low_rank_dim=args.local_rank,
+                block_size=args.block_size,
+                num_anchors=args.num_anchors,
+                loss_decay_gamma=args.loss_decay_gamma,
+                lm_head_mode=local_lm_head_mode,
+                lm_head_init=args.local_lm_head_init,
+                rnn_parameterization=args.rnn_parameterization,
+                rank_activation=args.local_rank_activation,
+                up_proj_init=args.local_up_proj_init,
+            ).to(device=device, dtype=torch.bfloat16)
+
     embed_tokens = target_components.embed_tokens
     target_lm_head = target_components.lm_head
     vocab_size, target_hidden_size = target_lm_head.weight.shape
@@ -711,17 +863,19 @@ def build_local_head_model(args, target_components, tokenizer, device):
     local_head_model = OnlineLocalHeadModel(
         target_embed_tokens=embed_tokens,
         target_lm_head=target_lm_head
-        if args.local_lm_head_mode == "target_lm_head"
+        if local_lm_head_mode == "target_lm_head"
         else None,
         vocab_size=vocab_size,
         embed_dim=embed_dim,
+        input_rank_dim=input_rank_dim,
         gru_hidden_dim=args.local_gru_hidden_dim,
         low_rank_dim=args.local_rank,
         block_size=args.block_size,
         num_anchors=args.num_anchors,
         loss_decay_gamma=args.loss_decay_gamma,
-        lm_head_mode=args.local_lm_head_mode,
+        lm_head_mode=local_lm_head_mode,
         lm_head_init=args.local_lm_head_init,
+        rnn_parameterization=args.rnn_parameterization,
         rank_activation=args.local_rank_activation,
         up_proj_init=args.local_up_proj_init,
     )
@@ -771,8 +925,14 @@ def main():
 
     target_components = None
     if not (
-        args.local_head_type == "markov"
-        and args.markov_parameterization == "direct_vocab"
+        (
+            args.local_head_type == "markov"
+            and args.markov_parameterization == "direct_vocab"
+        )
+        or (
+            args.local_head_type == "rnn"
+            and args.rnn_parameterization == "direct_vocab"
+        )
     ):
         print_on_rank0("Loading target embeddings and head...")
         target_components = TargetEmbeddingsAndHead.from_pretrained(
@@ -797,9 +957,12 @@ def main():
     else:
         print_on_rank0(
             "RNN local head config: "
+            f"parameterization={args.rnn_parameterization}, "
             f"block_size={args.block_size}, "
-            f"gru_hidden_dim={args.local_gru_hidden_dim}, rank={args.local_rank}, "
-            f"lm_head_mode={args.local_lm_head_mode}, "
+            f"input_rank={local_head_model.input_rank_dim}, "
+            f"gru_hidden_dim={args.local_gru_hidden_dim}, "
+            f"output_rank={args.local_rank}, "
+            f"lm_head_mode={local_head_model.lm_head_mode}, "
             f"rank_activation={args.local_rank_activation}"
         )
     print_on_rank0(
@@ -822,7 +985,9 @@ def main():
         missing, unexpected = local_head_model.load_state_dict(
             resume_state["model_state_dict"], strict=False
         )
-        missing = [name for name in missing if not _is_frozen_target_key(name)]
+        missing = [
+            name for name in missing if not _is_frozen_target_key(name, local_head_model)
+        ]
         if missing or unexpected:
             raise RuntimeError(
                 f"Unexpected local-head checkpoint mismatch: "
