@@ -40,6 +40,7 @@ dev = [
     "unittest"
 ]
 fa = ["flash-attn"]
+dels-plots = ["matplotlib"]
 
 [tool.setuptools.dynamic]
 version = {file = "version.txt"}

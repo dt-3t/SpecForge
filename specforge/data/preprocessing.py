@@ -177,6 +177,34 @@ def preprocess_conversations(
     return results
 
 
+def preprocess_raw_texts(
+    tokenizer: PreTrainedTokenizer,
+    texts: List[str],
+    max_length: int = 2048,
+) -> Dict[str, List[torch.Tensor]]:
+    """Tokenize raw text for next-token-prediction style local-head training."""
+    results = {"input_ids": [], "loss_mask": [], "attention_mask": []}
+    for text in texts:
+        if not text:
+            continue
+        encoding = tokenizer(
+            text,
+            max_length=max_length,
+            truncation=True,
+            return_tensors="pt",
+            add_special_tokens=False,
+        )
+        input_ids = encoding.input_ids[0]
+        if input_ids.numel() == 0:
+            continue
+        loss_mask = torch.ones_like(input_ids, dtype=torch.long)
+        loss_mask[-1] = 0
+        results["input_ids"].append(input_ids[None, :])
+        results["loss_mask"].append(loss_mask[None, :])
+        results["attention_mask"].append(torch.ones_like(loss_mask)[None, :])
+    return results
+
+
 def preprocess_vlm_conversations(
     processor: ImageProcessingMixin,
     examples: List[Conversation],
@@ -304,6 +332,7 @@ def build_eagle3_dataset(
     cache_key: Optional[str] = None,
     is_vlm: Optional[bool] = False,
     processor: Optional[ImageProcessingMixin] = None,
+    data_format: Optional[str] = None,
     is_preformatted: Optional[bool] = False,
     train_only_last_turn: Optional[bool] = False,
     minimum_valid_tokens: Optional[int] = None,
@@ -325,6 +354,9 @@ def build_eagle3_dataset(
         cache_key: The key to use for caching the processed dataset.
         is_vlm: Whether the dataset is for VLM models.
         processor: The image processor to use for processing images.
+        data_format: Dataset format. One of conversation, preformatted, raw_text.
+                    If omitted, falls back to is_preformatted for backward
+                    compatibility.
         is_preformatted: Whether the dataset contains preformatted text of the conversation
                         (e.g. includes system prompt, user and assistant start and end tokens)
                         and doesn't need to have the chat template applied.
@@ -344,16 +376,28 @@ def build_eagle3_dataset(
 
     if is_vlm:
         assert processor is not None, "processor must be provided when is_vlm is True"
+    if data_format is None:
+        data_format = "preformatted" if is_preformatted else "conversation"
+    if data_format not in {"conversation", "preformatted", "raw_text"}:
+        raise ValueError(
+            "data_format must be one of conversation, preformatted, raw_text; "
+            f"got {data_format!r}"
+        )
+    if is_preformatted and data_format != "preformatted":
+        raise ValueError("is_preformatted=True requires data_format='preformatted'")
 
     # Validate chat_template requirement
-    if chat_template is None:
+    if data_format != "raw_text" and chat_template is None:
         raise ValueError("chat_template must be provided for all dataset types")
 
-    assert (
-        chat_template in TEMPLATE_REGISTRY.get_all_template_names()
-    ), f"Chat template {chat_template} not found in TEMPLATE_REGISTRY, you may need to register it first"
+    if data_format != "raw_text":
+        assert (
+            chat_template in TEMPLATE_REGISTRY.get_all_template_names()
+        ), f"Chat template {chat_template} not found in TEMPLATE_REGISTRY, you may need to register it first"
 
-    template: ChatTemplate = TEMPLATE_REGISTRY.get(chat_template)
+    template: Optional[ChatTemplate] = (
+        None if data_format == "raw_text" else TEMPLATE_REGISTRY.get(chat_template)
+    )
 
     dataset = dataset.shuffle(seed=shuffle_seed)
     original_cols = dataset.column_names
@@ -367,7 +411,17 @@ def build_eagle3_dataset(
                 template,
                 max_length,
             )
-        elif is_preformatted:
+        elif data_format == "raw_text":
+            if "text" not in examples:
+                raise ValueError(
+                    f"Expected 'text' column for data_format='raw_text', but found columns: {list(examples.keys())}"
+                )
+            processed = preprocess_raw_texts(
+                tokenizer,
+                examples["text"],
+                max_length,
+            )
+        elif data_format == "preformatted":
             # Handle pre-formatted text (should be in "text" column)
             if "text" not in examples:
                 raise ValueError(

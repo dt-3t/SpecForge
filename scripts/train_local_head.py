@@ -3,23 +3,22 @@
 """Train standalone RNN or Markov local heads for DeLS-Spec."""
 
 import argparse
-import json
+import glob
 import logging
 import math
 import os
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
-import numpy as np
 import torch
 import torch.distributed as dist
 from accelerate.utils import set_seed
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictType
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 from tqdm import tqdm
-from transformers import AutoTokenizer
+from transformers import AutoConfig, AutoTokenizer
 
 from specforge.args import TrackerArgs
 from specforge.core.local_head import (
@@ -29,7 +28,11 @@ from specforge.core.local_head import (
 )
 from specforge.optimizer import BF16Optimizer
 from specforge.tracker import create_tracker
+from specforge.data.unigram import count_loss_mask_unigrams, save_unigram_outputs
 from specforge.utils import get_last_checkpoint, get_local_device, print_on_rank0
+
+
+logger = logging.getLogger(__name__)
 
 
 DEFAULT_LOSS_DECAY_GAMMA_BY_BLOCK_SIZE = {
@@ -123,16 +126,6 @@ def parse_args():
         ),
     )
     model_group.add_argument(
-        "--local-lm-head-mode",
-        type=str,
-        default="auto",
-        choices=["auto", "low_rank", "target_lm_head"],
-        help=(
-            "Legacy output-head override. auto selects target_lm_head for "
-            "target_factorized RNN and low_rank for direct_vocab RNN."
-        ),
-    )
-    model_group.add_argument(
         "--local-lm-head-init",
         type=str,
         default="random",
@@ -156,7 +149,7 @@ def parse_args():
         choices=["random", "zero"],
         help=(
             "Initialization for the trainable r->target-hidden projection used "
-            "with --local-lm-head-mode target_lm_head."
+            "with target_factorized RNN local heads."
         ),
     )
     model_group.add_argument(
@@ -201,8 +194,33 @@ def parse_args():
     dataset_group = parser.add_argument_group("dataset")
     dataset_group.add_argument("--train-data-path", type=str, required=True)
     dataset_group.add_argument("--eval-data-path", type=str, default=None)
+    dataset_group.add_argument(
+        "--data-format",
+        type=str,
+        default=None,
+        choices=["conversation", "preformatted", "raw_text"],
+        help=(
+            "Input dataset format. Defaults to conversation, or preformatted when "
+            "--is-preformatted is set. raw_text reads a text column and trains "
+            "next-token prediction directly."
+        ),
+    )
     dataset_group.add_argument("--chat-template", type=str, default="qwen")
     dataset_group.add_argument("--is-preformatted", action="store_true")
+    dataset_group.add_argument(
+        "--streaming",
+        action="store_true",
+        help=(
+            "Stream raw-text datasets instead of materializing an Arrow cache. "
+            "Only supported with --data-format raw_text."
+        ),
+    )
+    dataset_group.add_argument(
+        "--streaming-shuffle-buffer",
+        type=int,
+        default=10000,
+        help="Shuffle buffer size for --streaming raw-text datasets.",
+    )
     dataset_group.add_argument("--dataloader-num-workers", type=int, default=8)
     dataset_group.add_argument(
         "--build-dataset-num-proc",
@@ -218,8 +236,23 @@ def parse_args():
     training_group.add_argument("--warmup-ratio", type=float, default=0.04)
     training_group.add_argument("--max-grad-norm", type=float, default=1.0)
     training_group.add_argument("--accumulation-steps", type=int, default=1)
+    training_group.add_argument(
+        "--max-train-steps",
+        type=int,
+        default=None,
+        help="Required with --streaming; maximum dataloader steps to run.",
+    )
     training_group.add_argument("--seed", type=int, default=42)
     training_group.add_argument("--resume", action="store_true")
+    training_group.add_argument(
+        "--init-local-head-path",
+        type=str,
+        default=None,
+        help=(
+            "Warm-start local-head weights from a local_head.pt file or a "
+            "checkpoint directory, without restoring optimizer, epoch, or step."
+        ),
+    )
 
     output_group = parser.add_argument_group("output")
     output_group.add_argument("--output-dir", type=str, required=True)
@@ -285,7 +318,28 @@ def parse_args():
     dist_group.add_argument("--dist-timeout", type=int, default=30)
 
     args = parser.parse_args()
+    if args.resume and args.init_local_head_path:
+        parser.error("--resume cannot be used with --init-local-head-path.")
+    _resolve_data_format(parser, args)
     return _resolve_local_head_parameterization(parser, args)
+
+
+def _resolve_data_format(parser, args) -> None:
+    if args.data_format is None:
+        args.data_format = "preformatted" if args.is_preformatted else "conversation"
+        return
+
+    if args.is_preformatted and args.data_format != "preformatted":
+        parser.error("--is-preformatted conflicts with --data-format.")
+    args.is_preformatted = args.data_format == "preformatted"
+
+    if args.streaming:
+        if args.data_format != "raw_text":
+            parser.error("--streaming is currently only supported with raw_text data.")
+        if args.max_train_steps is None or args.max_train_steps <= 0:
+            parser.error("--streaming requires --max-train-steps > 0.")
+        if args.resume:
+            parser.error("--streaming does not currently support --resume.")
 
 
 def _resolve_local_head_parameterization(parser, args):
@@ -310,6 +364,138 @@ def _resolve_local_head_parameterization(parser, args):
     return args
 
 
+def _resolve_dataset_files(data_path: str) -> List[str]:
+    if any(char in data_path for char in "*?[]"):
+        files = sorted(glob.glob(data_path))
+    elif os.path.isdir(data_path):
+        files = sorted(
+            os.path.join(data_path, name)
+            for name in os.listdir(data_path)
+            if os.path.isfile(os.path.join(data_path, name))
+        )
+    else:
+        files = [data_path]
+
+    files = [
+        path for path in files if path.endswith((".json", ".jsonl", ".parquet"))
+    ]
+    if not files:
+        raise ValueError(f"No supported dataset files found for {data_path!r}.")
+    return files
+
+
+def _infer_dataset_loader(data_path: str) -> Tuple[str, List[str]]:
+    files = _resolve_dataset_files(data_path)
+    suffixes = {Path(path).suffix for path in files}
+    if suffixes <= {".json", ".jsonl"}:
+        return "json", files
+    if suffixes == {".parquet"}:
+        return "parquet", files
+    raise ValueError(
+        f"Cannot mix dataset file formats for {data_path!r}: {sorted(suffixes)}"
+    )
+
+
+class StreamingRawTextDataset(IterableDataset):
+    def __init__(
+        self,
+        dataset,
+        tokenizer,
+        max_length: int,
+        min_loss_tokens: int,
+        rank: int,
+        world_size: int,
+    ):
+        self.dataset = dataset
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.min_loss_tokens = min_loss_tokens
+        self.rank = rank
+        self.world_size = world_size
+
+    def _tokenize(self, text: str):
+        if not text:
+            return None
+        encoding = self.tokenizer(
+            text,
+            max_length=self.max_length,
+            truncation=True,
+            return_tensors="pt",
+            add_special_tokens=False,
+        )
+        input_ids = encoding.input_ids[0]
+        if input_ids.numel() == 0:
+            return None
+        loss_mask = torch.ones_like(input_ids, dtype=torch.long)
+        loss_mask[-1] = 0
+        if int(loss_mask.sum().item()) < self.min_loss_tokens:
+            return None
+        return {
+            "input_ids": input_ids[None, :],
+            "loss_mask": loss_mask[None, :],
+            "attention_mask": torch.ones_like(loss_mask)[None, :],
+        }
+
+    def __iter__(self):
+        dataset = self.dataset
+        worker = get_worker_info()
+        worker_id = 0 if worker is None else worker.id
+        num_workers = 1 if worker is None else worker.num_workers
+        num_shards = self.world_size * num_workers
+        shard_index = self.rank * num_workers + worker_id
+
+        if hasattr(dataset, "shard"):
+            dataset = dataset.shard(num_shards=num_shards, index=shard_index)
+            for row in dataset:
+                item = self._tokenize(row.get("text", ""))
+                if item is not None:
+                    yield item
+        else:
+            for idx, row in enumerate(dataset):
+                if idx % num_shards != shard_index:
+                    continue
+                item = self._tokenize(row.get("text", ""))
+                if item is not None:
+                    yield item
+
+
+def _build_streaming_raw_text_dataloader(args, tokenizer, load_dataset):
+    from specforge.data.utils import DataCollatorWithPadding
+    from specforge.distributed import get_dp_group
+
+    train_loader, train_files = _infer_dataset_loader(args.train_data_path)
+    dataset = load_dataset(train_loader, data_files=train_files, streaming=True)["train"]
+    if args.streaming_shuffle_buffer > 0:
+        dataset = dataset.shuffle(
+            buffer_size=args.streaming_shuffle_buffer, seed=args.seed
+        )
+
+    process_group = get_dp_group()
+    min_loss_tokens = 2 * args.block_size if args.local_head_type == "rnn" else 1
+    iterable = StreamingRawTextDataset(
+        dataset=dataset,
+        tokenizer=tokenizer,
+        max_length=args.max_length,
+        min_loss_tokens=min_loss_tokens,
+        rank=dist.get_rank(process_group),
+        world_size=dist.get_world_size(process_group),
+    )
+
+    if args.dataloader_num_workers != 0:
+        print_on_rank0(
+            "Streaming raw_text uses num_workers=0 to avoid partial iteration "
+            "from DataLoader worker sharding."
+        )
+    return DataLoader(
+        iterable,
+        batch_size=args.batch_size,
+        num_workers=0,
+        prefetch_factor=None,
+        collate_fn=DataCollatorWithPadding(),
+        drop_last=True,
+    )
+
+
 def build_dataloader(
     args, tokenizer
 ) -> Tuple[DataLoader, Optional[DataLoader], object]:
@@ -320,20 +506,29 @@ def build_dataloader(
     from specforge.data import build_eagle3_dataset, prepare_dp_dataloaders
     from specforge.distributed import get_dp_group
 
+    if args.streaming:
+        train_dataloader = _build_streaming_raw_text_dataloader(
+            args, tokenizer, load_dataset
+        )
+        return train_dataloader, None, None
+
     cache_params_string = (
         f"{args.local_head_type}-local-head-{args.train_data_path}-"
         f"{args.max_length}-"
         f"{args.chat_template}-"
+        f"{args.data_format}-"
         f"{args.target_model_path}"
     )
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
 
-    train_dataset = load_dataset("json", data_files=args.train_data_path)["train"]
+    train_loader, train_files = _infer_dataset_loader(args.train_data_path)
+    train_dataset = load_dataset(train_loader, data_files=train_files)["train"]
     train_dataset = build_eagle3_dataset(
         dataset=train_dataset,
         tokenizer=tokenizer,
         chat_template=args.chat_template,
         max_length=args.max_length,
+        data_format=args.data_format,
         is_preformatted=args.is_preformatted,
         cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
         cache_key=cache_key,
@@ -360,12 +555,14 @@ def build_dataloader(
 
     eval_dataloader = None
     if args.eval_data_path:
-        eval_dataset = load_dataset("json", data_files=args.eval_data_path)["train"]
+        eval_loader, eval_files = _infer_dataset_loader(args.eval_data_path)
+        eval_dataset = load_dataset(eval_loader, data_files=eval_files)["train"]
         eval_dataset = build_eagle3_dataset(
             dataset=eval_dataset,
             tokenizer=tokenizer,
             chat_template=args.chat_template,
             max_length=args.max_length,
+            data_format=args.data_format,
             is_preformatted=args.is_preformatted,
         )
         eval_dataloader = prepare_dp_dataloaders(
@@ -388,6 +585,49 @@ def _is_frozen_target_key(name: str, model=None) -> bool:
     if getattr(model, "rnn_parameterization", None) == "direct_vocab":
         return False
     return True
+
+
+def _resolve_local_head_checkpoint_path(path: str) -> str:
+    if os.path.isdir(path):
+        return os.path.join(path, "local_head.pt")
+    return path
+
+
+def _load_local_head_checkpoint(
+    local_head_model,
+    checkpoint_path: str,
+    local_head_type: str,
+) -> dict:
+    checkpoint_path = _resolve_local_head_checkpoint_path(checkpoint_path)
+    if not os.path.isfile(checkpoint_path):
+        raise FileNotFoundError(f"Local-head checkpoint not found: {checkpoint_path}")
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    checkpoint_type = checkpoint.get("model_config", {}).get("local_head_type")
+    if checkpoint_type is not None and checkpoint_type != local_head_type:
+        raise RuntimeError(
+            f"Checkpoint local_head_type mismatch: "
+            f"checkpoint={checkpoint_type}, current={local_head_type}"
+        )
+    if "model_state_dict" not in checkpoint:
+        raise RuntimeError(
+            f"{checkpoint_path} does not contain model_state_dict. "
+            "Use a training local_head.pt checkpoint, not a merged inference artifact."
+        )
+
+    missing, unexpected = local_head_model.load_state_dict(
+        checkpoint["model_state_dict"], strict=False
+    )
+    missing = [
+        name for name in missing if not _is_frozen_target_key(name, local_head_model)
+    ]
+    if missing or unexpected:
+        raise RuntimeError(
+            f"Unexpected local-head checkpoint mismatch: "
+            f"missing={missing}, unexpected={unexpected}"
+        )
+    checkpoint["_checkpoint_path"] = checkpoint_path
+    return checkpoint
 
 
 def _local_head_config(args, model) -> dict:
@@ -568,6 +808,7 @@ def record_metrics(
     train_dataloader=None,
     mode: str = "train",
     extra_metrics: dict = None,
+    progress_bar=None,
 ) -> None:
     logdict = {}
     if mode == "train" and optimizer is not None:
@@ -579,209 +820,76 @@ def record_metrics(
             {f"{mode}/{k}": float(v) for k, v in extra_metrics.items() if v is not None}
         )
 
+    total_log_steps = (
+        args.max_train_steps
+        if getattr(args, "streaming", False)
+        else args.num_epochs * len(train_dataloader) // args.accumulation_steps
+    )
     print_msg = (
         f"{mode.capitalize()} - Step {global_step} "
-        f"[{global_step}/"
-        f"{args.num_epochs * len(train_dataloader) // args.accumulation_steps}?], "
+        f"[{global_step}/{total_log_steps}?], "
         f"Loss: {loss:.4f}, Acc: {accuracy:.4f}"
     )
-    print_on_rank0(print_msg)
+    if dist.get_rank() == 0 and progress_bar is not None and hasattr(
+        progress_bar, "write"
+    ):
+        progress_bar.write(print_msg)
+    else:
+        print_on_rank0(print_msg)
     tracker.log(logdict, step=global_step)
-
-
-def _ensure_count_capacity(counts: torch.Tensor, max_token_id: int) -> torch.Tensor:
-    if max_token_id < counts.numel():
-        return counts
-    expanded = torch.zeros(max_token_id + 1, dtype=counts.dtype)
-    expanded[: counts.numel()] = counts
-    return expanded
-
-
-def count_loss_mask_unigrams(dataset, tokenizer) -> Dict[str, torch.Tensor]:
-    vocab_size = len(tokenizer)
-    counts = torch.zeros(vocab_size, dtype=torch.long)
-    total_target_tokens = 0
-
-    for idx in tqdm(range(len(dataset)), desc="Counting loss_mask target tokens"):
-        row = dataset[idx]
-        input_ids = torch.as_tensor(row["input_ids"]).view(-1).long()
-        loss_mask = torch.as_tensor(row["loss_mask"]).view(-1) > 0
-        if input_ids.numel() != loss_mask.numel():
-            raise ValueError(
-                f"Sample {idx} has mismatched input_ids/loss_mask lengths: "
-                f"{input_ids.numel()} vs {loss_mask.numel()}"
-            )
-
-        target_ids = input_ids[loss_mask]
-        if target_ids.numel() == 0:
-            continue
-
-        max_token_id = int(target_ids.max().item())
-        counts = _ensure_count_capacity(counts, max_token_id)
-        counts += torch.bincount(target_ids, minlength=counts.numel())
-        total_target_tokens += int(target_ids.numel())
-
-    if total_target_tokens == 0:
-        raise ValueError("No tokens with loss_mask == 1 were found.")
-
-    p = counts.to(torch.float64) / float(total_target_tokens)
-    log_p = torch.full_like(p, -math.inf)
-    nonzero = counts > 0
-    log_p[nonzero] = torch.log(p[nonzero])
-
-    return {
-        "counts": counts,
-        "p": p,
-        "log_p": log_p,
-        "total_target_tokens": torch.tensor(total_target_tokens, dtype=torch.long),
-        "num_samples": torch.tensor(len(dataset), dtype=torch.long),
-    }
-
-
-def _token_strings(tokenizer, token_id: int) -> Dict[str, str]:
-    token = tokenizer.convert_ids_to_tokens(token_id)
-    text = tokenizer.decode([token_id], clean_up_tokenization_spaces=False)
-    return {"token": token, "text": text}
-
-
-def write_top_tokens(
-    stats: Dict[str, torch.Tensor],
-    tokenizer,
-    output_path: Path,
-    top_k: int,
-) -> List[Dict]:
-    counts = stats["counts"]
-    p = stats["p"]
-    log_p = stats["log_p"]
-    positive_ids = torch.where(counts > 0)[0]
-    rows = []
-    if positive_ids.numel() > 0:
-        k = min(top_k, int(positive_ids.numel()))
-        top_counts, top_indices = torch.topk(counts[positive_ids], k=k)
-        top_ids = positive_ids[top_indices]
-        for token_id, count in zip(top_ids.tolist(), top_counts.tolist()):
-            strings = _token_strings(tokenizer, token_id)
-            rows.append(
-                {
-                    "token_id": token_id,
-                    "count": int(count),
-                    "p": float(p[token_id].item()),
-                    "log_p": float(log_p[token_id].item()),
-                    **strings,
-                }
-            )
-
-    with output_path.open("w", encoding="utf-8") as f:
-        json.dump(rows, f, indent=2, ensure_ascii=False)
-    return rows
-
-
-def plot_unigram_distribution(
-    stats: Dict[str, torch.Tensor],
-    top_rows: List[Dict],
-    output_dir: Path,
-    plot_top_k: int,
-) -> None:
-    try:
-        import matplotlib
-
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except ImportError:
-        print_on_rank0("matplotlib is not installed; skipping unigram plots.")
-        return
-
-    def safe_label(value) -> str:
-        label = repr("" if value is None else value)
-        label = label.replace("$", r"\$")
-        if len(label) > 30:
-            label = label[:27] + "..."
-        return label
-
-    rows = top_rows[:plot_top_k]
-    if rows:
-        labels = []
-        values = []
-        for row in rows:
-            token_label = row["token"]
-            if token_label is None:
-                token_label = row["text"]
-            labels.append(f"{row['token_id']}: {safe_label(token_label)}")
-            values.append(row["p"])
-
-        height = max(6.0, 0.25 * len(rows))
-        fig, ax = plt.subplots(figsize=(12, height))
-        ax.barh(range(len(rows)), values)
-        ax.set_yticks(range(len(rows)))
-        ax.set_yticklabels(labels, fontsize=8)
-        ax.invert_yaxis()
-        ax.set_xlabel("p(token | loss_mask=1)")
-        ax.set_title(f"Top {len(rows)} Loss-Mask Target Token Unigrams")
-        fig.tight_layout()
-        fig.savefig(output_dir / "loss_mask_unigram_top_tokens.png", dpi=200)
-        plt.close(fig)
-
-    positive_p = stats["p"][stats["counts"] > 0].cpu().numpy()
-    positive_p = np.sort(positive_p)[::-1]
-    ranks = np.arange(1, len(positive_p) + 1)
-    fig, ax = plt.subplots(figsize=(8, 6))
-    ax.loglog(ranks, positive_p)
-    ax.set_xlabel("Rank")
-    ax.set_ylabel("p(token | loss_mask=1)")
-    ax.set_title("Loss-Mask Target Token Unigram Zipf Plot")
-    ax.grid(True, which="both", linestyle=":", linewidth=0.5)
-    fig.tight_layout()
-    fig.savefig(output_dir / "loss_mask_unigram_zipf.png", dpi=200)
-    plt.close(fig)
 
 
 def save_unigram_prior(args, tokenizer, dataset) -> None:
     output_dir = Path(
         args.unigram_output_dir or os.path.join(args.output_dir, "loss_mask_unigram")
     )
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    stats = count_loss_mask_unigrams(dataset, tokenizer=tokenizer)
+    stats = count_loss_mask_unigrams(
+        dataset,
+        tokenizer=tokenizer,
+        vocab_size=_target_vocab_size(args, tokenizer),
+    )
     metadata = {
         "target_model_path": args.target_model_path,
         "train_data_path": args.train_data_path,
         "chat_template": args.chat_template,
         "is_preformatted": bool(args.is_preformatted),
+        "data_format": args.data_format,
         "max_length": int(args.max_length),
-        "vocab_size": int(stats["counts"].numel()),
-        "num_samples": int(stats["num_samples"].item()),
-        "total_target_tokens": int(stats["total_target_tokens"].item()),
     }
-
-    torch.save({**stats, "metadata": metadata}, output_dir / "loss_mask_unigram.pt")
-    np.savez_compressed(
-        output_dir / "loss_mask_unigram.npz",
-        counts=stats["counts"].cpu().numpy(),
-        p=stats["p"].cpu().numpy(),
-        log_p=stats["log_p"].cpu().numpy(),
-    )
-    with (output_dir / "metadata.json").open("w", encoding="utf-8") as f:
-        json.dump(metadata, f, indent=2, ensure_ascii=False)
-
-    top_rows = write_top_tokens(
+    save_unigram_outputs(
         stats,
         tokenizer=tokenizer,
-        output_path=output_dir / "top_tokens.json",
+        output_dir=output_dir,
+        metadata=metadata,
         top_k=args.unigram_top_k,
+        plot=args.plot_unigram_prior,
+        plot_top_k=args.unigram_plot_top_k,
+        log_fn=print_on_rank0,
     )
-    if args.plot_unigram_prior:
-        plot_unigram_distribution(
-            stats,
-            top_rows,
-            output_dir,
-            plot_top_k=args.unigram_plot_top_k,
-        )
 
-    print_on_rank0(
-        "Saved loss-mask target-token unigram stats to "
-        f"{output_dir} with {metadata['total_target_tokens']} target tokens "
-        f"from {metadata['num_samples']} samples."
+
+def _target_vocab_size(args, tokenizer) -> int:
+    config = AutoConfig.from_pretrained(
+        args.target_model_path,
+        trust_remote_code=args.trust_remote_code,
     )
+    vocab_size = int(getattr(config, "vocab_size", len(tokenizer)))
+    tokenizer_size = len(tokenizer)
+    if vocab_size < tokenizer_size:
+        raise ValueError(
+            f"Target config vocab_size ({vocab_size}) is smaller than tokenizer "
+            f"size ({tokenizer_size})."
+        )
+    if vocab_size != tokenizer_size:
+        message = (
+            f"Using target config vocab_size={vocab_size}; tokenizer size is "
+            f"{tokenizer_size}."
+        )
+        if dist.is_available() and dist.is_initialized():
+            print_on_rank0(message)
+        else:
+            logger.info(message)
+    return vocab_size
 
 
 def build_local_head_model(args, target_components, tokenizer, device):
@@ -789,46 +897,29 @@ def build_local_head_model(args, target_components, tokenizer, device):
         args.local_head_type == "markov"
         and args.markov_parameterization == "direct_vocab"
     ):
+        vocab_size = _target_vocab_size(args, tokenizer)
         return OnlineDirectVocabMarkovLocalHeadModel(
-            vocab_size=len(tokenizer),
+            vocab_size=vocab_size,
             rank=args.markov_rank,
         ).to(device=device, dtype=torch.bfloat16)
 
     if args.local_head_type == "rnn":
-        if args.local_lm_head_mode == "auto":
-            local_lm_head_mode = (
-                "target_lm_head"
-                if args.rnn_parameterization == "target_factorized"
-                else "low_rank"
-            )
-        else:
-            local_lm_head_mode = args.local_lm_head_mode
-        if (
-            args.rnn_parameterization == "target_factorized"
-            and local_lm_head_mode != "target_lm_head"
-        ):
-            raise ValueError(
-                "RNN target_factorized parameterization requires "
-                "--local-lm-head-mode target_lm_head or auto."
-            )
-        if (
-            args.rnn_parameterization == "direct_vocab"
-            and local_lm_head_mode != "low_rank"
-        ):
-            raise ValueError(
-                "RNN direct_vocab parameterization requires "
-                "--local-lm-head-mode low_rank or auto."
-            )
+        local_lm_head_mode = (
+            "target_lm_head"
+            if args.rnn_parameterization == "target_factorized"
+            else "low_rank"
+        )
         input_rank_dim = (
             args.local_input_rank
             if args.local_input_rank is not None
             else args.local_rank
         )
         if args.rnn_parameterization == "direct_vocab":
+            vocab_size = _target_vocab_size(args, tokenizer)
             return OnlineLocalHeadModel(
                 target_embed_tokens=None,
                 target_lm_head=None,
-                vocab_size=len(tokenizer),
+                vocab_size=vocab_size,
                 embed_dim=input_rank_dim,
                 input_rank_dim=input_rank_dim,
                 gru_hidden_dim=args.local_gru_hidden_dim,
@@ -919,8 +1010,12 @@ def main():
     )
     del eval_dataloader
 
-    steps_per_epoch = math.ceil(len(train_dataloader) / args.accumulation_steps)
-    total_steps = args.num_epochs * steps_per_epoch
+    if args.streaming:
+        steps_per_epoch = args.max_train_steps
+        total_steps = math.ceil(args.max_train_steps / args.accumulation_steps)
+    else:
+        steps_per_epoch = math.ceil(len(train_dataloader) / args.accumulation_steps)
+        total_steps = args.num_epochs * steps_per_epoch
     print_on_rank0(f"Total training steps: {total_steps}")
 
     target_components = None
@@ -970,30 +1065,28 @@ def main():
         f"{sum(p.numel() for p in local_head_model.parameters() if p.requires_grad):,}"
     )
 
+    if args.init_local_head_path:
+        init_state = _load_local_head_checkpoint(
+            local_head_model,
+            args.init_local_head_path,
+            args.local_head_type,
+        )
+        print_on_rank0(
+            "Initialized local head weights from checkpoint: "
+            f"{init_state['_checkpoint_path']}"
+        )
+        del init_state
+
     resume_state = None
     if local_head_last_checkpoint:
-        checkpoint_path = os.path.join(local_head_last_checkpoint, "local_head.pt")
-        resume_state = torch.load(
-            checkpoint_path, map_location="cpu", weights_only=False
+        resume_state = _load_local_head_checkpoint(
+            local_head_model,
+            local_head_last_checkpoint,
+            args.local_head_type,
         )
-        checkpoint_type = resume_state.get("model_config", {}).get("local_head_type")
-        if checkpoint_type is not None and checkpoint_type != args.local_head_type:
-            raise RuntimeError(
-                f"Checkpoint local_head_type mismatch: "
-                f"checkpoint={checkpoint_type}, current={args.local_head_type}"
-            )
-        missing, unexpected = local_head_model.load_state_dict(
-            resume_state["model_state_dict"], strict=False
+        print_on_rank0(
+            f"Loaded local head checkpoint: {resume_state['_checkpoint_path']}"
         )
-        missing = [
-            name for name in missing if not _is_frozen_target_key(name, local_head_model)
-        ]
-        if missing or unexpected:
-            raise RuntimeError(
-                f"Unexpected local-head checkpoint mismatch: "
-                f"missing={missing}, unexpected={unexpected}"
-            )
-        print_on_rank0(f"Loaded local head checkpoint: {checkpoint_path}")
 
     fsdp_model = FSDP(
         local_head_model,
@@ -1025,7 +1118,9 @@ def main():
             f"step={global_step}, lr={optimizer.get_learning_rate():.6f}"
         )
 
-    skip_steps = global_step - start_epoch * len(train_dataloader)
+    skip_steps = (
+        0 if args.streaming else global_step - start_epoch * len(train_dataloader)
+    )
 
     print_on_rank0(f"Initializing tracker (report_to={args.report_to})...")
     tracker = create_tracker(args, args.output_dir)
@@ -1033,7 +1128,8 @@ def main():
     print_on_rank0(f"Starting training from epoch {start_epoch}, step {global_step}")
 
     for epoch in range(start_epoch, args.num_epochs):
-        train_dataloader.sampler.set_epoch(epoch)
+        if not args.streaming:
+            train_dataloader.sampler.set_epoch(epoch)
         local_head_model.train()
         if hasattr(local_head_model, "embed_tokens"):
             local_head_model.embed_tokens.eval()
@@ -1041,8 +1137,17 @@ def main():
             local_head_model.target_lm_head.eval()
 
         if dist.get_rank() == 0:
+            tqdm_kwargs = {}
+            if args.streaming:
+                tqdm_kwargs = {
+                    "total": args.max_train_steps,
+                    "initial": global_step,
+                }
             progress_bar = tqdm(
-                train_dataloader, desc=f"Training Epoch {epoch}", leave=True
+                train_dataloader,
+                desc=f"Training Epoch {epoch}",
+                leave=True,
+                **tqdm_kwargs,
             )
         else:
             progress_bar = train_dataloader
@@ -1050,6 +1155,8 @@ def main():
         for step_in_epoch, data in enumerate(progress_bar):
             if epoch == start_epoch and step_in_epoch < skip_steps:
                 continue
+            if args.streaming and global_step >= args.max_train_steps:
+                break
             global_step += 1
 
             input_ids = data["input_ids"].to(device, non_blocking=True)
@@ -1084,6 +1191,7 @@ def main():
                     train_dataloader,
                     mode="train",
                     extra_metrics=metrics,
+                    progress_bar=progress_bar,
                 )
 
             if dist.get_rank() == 0:
@@ -1101,6 +1209,10 @@ def main():
                 save_checkpoint(
                     args, epoch, global_step, fsdp_model, local_head_model, optimizer
                 )
+            if args.streaming and global_step >= args.max_train_steps:
+                break
+        if args.streaming and global_step >= args.max_train_steps:
+            break
 
     save_checkpoint(
         args, args.num_epochs, global_step, fsdp_model, local_head_model, optimizer
@@ -1108,6 +1220,10 @@ def main():
 
     tracker.close()
     if args.save_unigram_prior:
+        if args.streaming:
+            print_on_rank0("Skipping unigram prior save for streaming datasets.")
+            destroy_distributed()
+            return
         dist.barrier()
         if dist.get_rank() == 0:
             save_unigram_prior(args, tokenizer, unigram_dataset)
